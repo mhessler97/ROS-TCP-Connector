@@ -15,8 +15,8 @@ namespace Unity.Robotics.ROSTCPConnector
 {
     public class ROSConnection : MonoBehaviour
     {
-        public const string k_Version = "v0.7.0";
-        public const string k_CompatibleVersionPrefix = "v0.7.";
+        public const string k_Version = "v0.8.0";
+        public const string k_CompatibleVersionPrefix = "v0.8.";
 
         // Variables required for ROS communication
         [SerializeField]
@@ -67,12 +67,55 @@ namespace Unity.Robotics.ROSTCPConnector
 
         private class ActionHandlers
         {
-            // (goal_id, raw_bytes)
-            public Action<string, byte[]> OnFeedbackBytes;
-            public Action<string, byte[]> OnResultBytes;
+            public readonly List<Action<string, byte[]>> FeedbackCallbacks = new List<Action<string, byte[]>>();
+            public readonly List<Action<string, byte[]>> ResultCallbacks = new List<Action<string, byte[]>>();
+
+            public bool HasFeedbackListeners => FeedbackCallbacks.Count > 0;
+            public bool HasResultListeners => ResultCallbacks.Count > 0;
+            public bool IsEmpty => FeedbackCallbacks.Count == 0 && ResultCallbacks.Count == 0;
         }
 
         private readonly Dictionary<string, ActionHandlers> m_ActionHandlers = new Dictionary<string, ActionHandlers>();
+        readonly object m_ActionHandlersLock = new object();
+        readonly object m_ActionRegistrationsLock = new object();
+        readonly Dictionary<string, SysCommand_ActionRegistration> m_ActionRegistrations =
+            new Dictionary<string, SysCommand_ActionRegistration>();
+
+        private sealed class ActionListenerRegistration : IDisposable
+        {
+            readonly ROSConnection m_Owner;
+            readonly string m_ActionName;
+            readonly Action<string, byte[]> m_Feedback;
+            readonly Action<string, byte[]> m_Result;
+            bool m_Disposed;
+
+            public ActionListenerRegistration(
+                ROSConnection owner,
+                string actionName,
+                Action<string, byte[]> feedback,
+                Action<string, byte[]> result)
+            {
+                m_Owner = owner;
+                m_ActionName = actionName;
+                m_Feedback = feedback;
+                m_Result = result;
+            }
+
+            public void Dispose()
+            {
+                if (m_Disposed)
+                    return;
+
+                m_Disposed = true;
+                m_Owner.UnregisterActionHandlers(m_ActionName, m_Feedback, m_Result);
+            }
+        }
+
+        private sealed class NullActionListenerRegistration : IDisposable
+        {
+            public static readonly NullActionListenerRegistration Instance = new NullActionListenerRegistration();
+            public void Dispose() { }
+        }
 
         class OutgoingMessageQueue
         {
@@ -135,6 +178,8 @@ namespace Unity.Robotics.ROSTCPConnector
         }
 
         MessageSerializer m_MessageSerializer = new MessageSerializer();
+        readonly MessageSerializer m_ActionPayloadSerializer = new MessageSerializer();
+        readonly object m_ActionPayloadSerializerLock = new object();
         MessageDeserializer m_MessageDeserializer = new MessageDeserializer();
         List<Action<string[]>> m_TopicsListCallbacks = new List<Action<string[]>>();
         List<Action<Dictionary<string, string>>> m_TopicsAndTypesListCallbacks = new List<Action<Dictionary<string, string>>>();
@@ -376,11 +421,46 @@ namespace Unity.Robotics.ROSTCPConnector
 
         public void RegisterRosActionClient(string actionName, string actionType)
         {
-            QueueSysCommand("__ros_action", new SysCommand_ActionRegistration
+            var registration = new SysCommand_ActionRegistration
             {
                 action_name = actionName,
                 action_type = actionType
-            });
+            };
+
+            lock (m_ActionRegistrationsLock)
+            {
+                m_ActionRegistrations[actionName] = registration;
+            }
+
+            EnqueueActionRegistration(registration);
+        }
+
+        void EnqueueActionRegistration(SysCommand_ActionRegistration registration)
+        {
+            QueueSysCommand("__ros_action", registration);
+        }
+
+        void EnqueueActionRegistrationThreadSafe(SysCommand_ActionRegistration registration)
+        {
+            MessageSerializer messageSerializer = new MessageSerializer();
+            PopulateSysCommand(messageSerializer, "__ros_action", registration);
+            m_OutgoingMessageQueue.Enqueue(new SysCommandSender(messageSerializer.GetBytesSequence()));
+        }
+
+        void ReplayRosActionRegistrations()
+        {
+            List<SysCommand_ActionRegistration> snapshot = null;
+            lock (m_ActionRegistrationsLock)
+            {
+                if (m_ActionRegistrations.Count > 0)
+                    snapshot = new List<SysCommand_ActionRegistration>(m_ActionRegistrations.Values);
+            }
+
+            if (snapshot == null)
+                return;
+
+            foreach (var registration in snapshot)
+                EnqueueActionRegistrationThreadSafe(registration);
         }
 
         public string SendActionGoal<TGoal>(string actionName, TGoal goal, string goalId = null)
@@ -388,6 +468,8 @@ namespace Unity.Robotics.ROSTCPConnector
         {
             if (string.IsNullOrEmpty(goalId))
                 goalId = Guid.NewGuid().ToString();
+            if (goal == null)
+                throw new ArgumentNullException(nameof(goal));
 
             // 1) Tell endpoint a goal is coming
             QueueSysCommand("__action_goal", new SysCommand_ActionWithGoalId
@@ -396,16 +478,8 @@ namespace Unity.Robotics.ROSTCPConnector
                 goal_id = goalId
             });
 
-            // 2) Send the goal payload as a normal framed message to `actionName`.
-            // We ensure a publisher exists for `actionName` with the goal's ROS type,
-            // then publish once. (Safe if re-called; duplicate registration is harmless.)
-            try
-            {
-                RegisterPublisher<TGoal>(actionName, 1, false);
-            }
-            catch { /* already registered */ }
-
-            Publish(actionName, goal);
+            // 2) Send the goal payload as a framed message directly to `actionName`.
+            QueueActionPayload(actionName, goal);
             return goalId;
         }
 
@@ -418,16 +492,81 @@ namespace Unity.Robotics.ROSTCPConnector
             });
         }
 
+        void QueueActionPayload<TGoal>(string actionName, TGoal goal) where TGoal : Message
+        {
+            lock (m_ActionPayloadSerializerLock)
+            {
+                m_ActionPayloadSerializer.Clear();
+                m_ActionPayloadSerializer.Write(actionName);
+                m_ActionPayloadSerializer.SerializeMessageWithLength(goal);
+                m_OutgoingMessageQueue.Enqueue(new SerializedMessageSender(m_ActionPayloadSerializer.GetBytesSequence()));
+            }
+        }
+
+        internal IDisposable RegisterActionHandlers(
+            string actionName,
+            Action<string, byte[]> onFeedbackBytes,
+            Action<string, byte[]> onResultBytes)
+        {
+            if (string.IsNullOrEmpty(actionName))
+                throw new ArgumentException("actionName cannot be null or empty.", nameof(actionName));
+
+            if (onFeedbackBytes == null && onResultBytes == null)
+                return NullActionListenerRegistration.Instance;
+
+            lock (m_ActionHandlersLock)
+            {
+                if (!m_ActionHandlers.TryGetValue(actionName, out var handlers))
+                {
+                    handlers = new ActionHandlers();
+                    m_ActionHandlers[actionName] = handlers;
+                }
+
+                if (onFeedbackBytes != null)
+                    handlers.FeedbackCallbacks.Add(onFeedbackBytes);
+
+                if (onResultBytes != null)
+                    handlers.ResultCallbacks.Add(onResultBytes);
+            }
+
+            return new ActionListenerRegistration(this, actionName, onFeedbackBytes, onResultBytes);
+        }
+
+        void UnregisterActionHandlers(
+            string actionName,
+            Action<string, byte[]> onFeedbackBytes,
+            Action<string, byte[]> onResultBytes)
+        {
+            if (string.IsNullOrEmpty(actionName))
+                return;
+
+            lock (m_ActionHandlersLock)
+            {
+                if (!m_ActionHandlers.TryGetValue(actionName, out var handlers))
+                    return;
+
+                if (onFeedbackBytes != null)
+                    handlers.FeedbackCallbacks.Remove(onFeedbackBytes);
+
+                if (onResultBytes != null)
+                    handlers.ResultCallbacks.Remove(onResultBytes);
+
+                if (handlers.IsEmpty)
+                    m_ActionHandlers.Remove(actionName);
+            }
+        }
+
         public void ListenForAction<TFeedback, TResult>(
             string actionName,
             Action<string, TFeedback> onFeedback,   // (goal_id, message)
             Action<string, TResult> onResult)       // (goal_id, message)
             where TFeedback : Message
-            where TResult   : Message
+            where TResult : Message
         {
-            m_ActionHandlers[actionName] = new ActionHandlers
+            Action<string, byte[]> feedbackWrapper = null;
+            if (onFeedback != null)
             {
-                OnFeedbackBytes = (goalId, bytes) =>
+                feedbackWrapper = (goalId, bytes) =>
                 {
                     try
                     {
@@ -435,8 +574,13 @@ namespace Unity.Robotics.ROSTCPConnector
                         onFeedback?.Invoke(goalId, msg);
                     }
                     catch (Exception ex) { Debug.LogException(ex); }
-                },
-                OnResultBytes = (goalId, bytes) =>
+                };
+            }
+
+            Action<string, byte[]> resultWrapper = null;
+            if (onResult != null)
+            {
+                resultWrapper = (goalId, bytes) =>
                 {
                     try
                     {
@@ -444,8 +588,20 @@ namespace Unity.Robotics.ROSTCPConnector
                         onResult?.Invoke(goalId, msg);
                     }
                     catch (Exception ex) { Debug.LogException(ex); }
-                }
-            };
+                };
+            }
+
+            RegisterActionHandlers(actionName, feedbackWrapper, resultWrapper);
+        }
+
+        public RosActionClient<TGoal, TFeedback, TResult> CreateActionClient<TGoal, TFeedback, TResult>(
+            string actionName,
+            string actionType)
+            where TGoal : Message
+            where TFeedback : Message
+            where TResult : Message
+        {
+            return new RosActionClient<TGoal, TFeedback, TResult>(this, actionName, actionType);
         }
 
         [Obsolete("Calling ImplementUnityService now implicitly registers it")]
@@ -614,6 +770,7 @@ namespace Unity.Robotics.ROSTCPConnector
                 topicInfo.OnConnectionEstablished(stream);
 
             RefreshTopicsList();
+            ReplayRosActionRegistrations();
         }
 
         void OnConnectionLostCallback()
@@ -828,51 +985,85 @@ namespace Unity.Robotics.ROSTCPConnector
 
                     break;
                 case "__action_feedback":
-                {
-                    var info = JsonUtility.FromJson<SysCommand_ActionWithGoalId>(json);
-                    // Next message will be the Feedback payload addressed to `info.action_name`
-                    m_SpecialIncomingMessageHandler = (string destination, byte[] payload) =>
                     {
-                        m_SpecialIncomingMessageHandler = null;
-                        if (!m_ActionHandlers.TryGetValue(info.action_name, out var h) || h.OnFeedbackBytes == null)
+                        var info = JsonUtility.FromJson<SysCommand_ActionWithGoalId>(json);
+                        // Next message will be the Feedback payload addressed to `info.action_name`
+                        m_SpecialIncomingMessageHandler = (string destination, byte[] payload) =>
                         {
-                            Debug.LogWarning($"No action feedback listener for {info.action_name} (goal {info.goal_id}).");
-                            return;
-                        }
-                        h.OnFeedbackBytes.Invoke(info.goal_id, payload);
-                    };
-                    break;
-                }
+                            m_SpecialIncomingMessageHandler = null;
+                            Action<string, byte[]>[] callbacks = null;
+                            lock (m_ActionHandlersLock)
+                            {
+                                if (m_ActionHandlers.TryGetValue(info.action_name, out var h) && h.HasFeedbackListeners)
+                                {
+                                    callbacks = h.FeedbackCallbacks.ToArray();
+                                }
+                            }
+
+                            if (callbacks == null || callbacks.Length == 0)
+                            {
+                                Debug.LogWarning($"No action feedback listener for {info.action_name} (goal {info.goal_id}).");
+                                return;
+                            }
+
+                            foreach (var callback in callbacks)
+                            {
+                                try
+                                {
+                                    callback(info.goal_id, payload);
+                                }
+                                catch (Exception ex) { Debug.LogException(ex); }
+                            }
+                        };
+                        break;
+                    }
                 case "__action_result":
-                {
-                    var info = JsonUtility.FromJson<SysCommand_ActionWithGoalId>(json);
-                    // Next message will be the Result payload addressed to `info.action_name`
-                    m_SpecialIncomingMessageHandler = (string destination, byte[] payload) =>
                     {
-                        m_SpecialIncomingMessageHandler = null;
-                        if (!m_ActionHandlers.TryGetValue(info.action_name, out var h) || h.OnResultBytes == null)
+                        var info = JsonUtility.FromJson<SysCommand_ActionWithGoalId>(json);
+                        // Next message will be the Result payload addressed to `info.action_name`
+                        m_SpecialIncomingMessageHandler = (string destination, byte[] payload) =>
                         {
-                            Debug.LogWarning($"No action result listener for {info.action_name} (goal {info.goal_id}).");
-                            return;
-                        }
-                        h.OnResultBytes.Invoke(info.goal_id, payload);
-                    };
-                    break;
-                }
+                            m_SpecialIncomingMessageHandler = null;
+                            Action<string, byte[]>[] callbacks = null;
+                            lock (m_ActionHandlersLock)
+                            {
+                                if (m_ActionHandlers.TryGetValue(info.action_name, out var h) && h.HasResultListeners)
+                                {
+                                    callbacks = h.ResultCallbacks.ToArray();
+                                }
+                            }
+
+                            if (callbacks == null || callbacks.Length == 0)
+                            {
+                                Debug.LogWarning($"No action result listener for {info.action_name} (goal {info.goal_id}).");
+                                return;
+                            }
+
+                            foreach (var callback in callbacks)
+                            {
+                                try
+                                {
+                                    callback(info.goal_id, payload);
+                                }
+                                catch (Exception ex) { Debug.LogException(ex); }
+                            }
+                        };
+                        break;
+                    }
                 case "__action_goal_request":
-                {
-                    // This is only relevant if you later add a Unity-side Action *server*.
-                    // For now, consume the following payload (the Goal) and log it so the queue stays aligned.
-                    var info = JsonUtility.FromJson<SysCommand_ActionWithGoalId>(json);
-                    m_SpecialIncomingMessageHandler = (string destination, byte[] payload) =>
                     {
-                        m_SpecialIncomingMessageHandler = null;
-                        Debug.LogWarning($"Received __action_goal_request for {info.action_name} (goal {info.goal_id}) " +
-                                        $"but no server-side handler is registered.");
-                        // If you implement a server, deserialize payload here as the Goal and start execution.
-                    };
-                    break;
-                }
+                        // This is only relevant if you later add a Unity-side Action *server*.
+                        // For now, consume the following payload (the Goal) and log it so the queue stays aligned.
+                        var info = JsonUtility.FromJson<SysCommand_ActionWithGoalId>(json);
+                        m_SpecialIncomingMessageHandler = (string destination, byte[] payload) =>
+                        {
+                            m_SpecialIncomingMessageHandler = null;
+                            Debug.LogWarning($"Received __action_goal_request for {info.action_name} (goal {info.goal_id}) " +
+                                            $"but no server-side handler is registered.");
+                            // If you implement a server, deserialize payload here as the Goal and start execution.
+                        };
+                        break;
+                    }
             }
         }
 

@@ -47,4 +47,28 @@ namespace Unity.Robotics.ROSTCPConnector
             m_ListOfSerializations.Clear();
         }
     }
+
+    public class SerializedMessageSender : OutgoingMessageSender
+    {
+        List<byte[]> m_SerializedMessages;
+
+        public SerializedMessageSender(IEnumerable<byte[]> serializedMessages)
+        {
+            m_SerializedMessages = new List<byte[]>(serializedMessages);
+        }
+
+        public override SendToState SendInternal(MessageSerializer m_MessageSerializer, Stream stream)
+        {
+            foreach (var message in m_SerializedMessages)
+            {
+                stream.Write(message, 0, message.Length);
+            }
+            return SendToState.Normal;
+        }
+
+        public override void ClearAllQueuedData()
+        {
+            m_SerializedMessages.Clear();
+        }
+    }
 }
