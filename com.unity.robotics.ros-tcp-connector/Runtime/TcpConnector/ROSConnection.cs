@@ -15,27 +15,23 @@ namespace Unity.Robotics.ROSTCPConnector
 {
     public class ROSConnection : MonoBehaviour
     {
-        public readonly struct ActionGoalSendResult
+        public readonly struct ActionGoalSendHandle
         {
             public readonly string GoalId;
-            public readonly bool Accepted;
-            public readonly string RosGoalId;
-            public readonly string Message;
-            public readonly bool TimedOut;
+            public readonly Task<SysCommand_ActionGoalResponse> Response;
 
-            public ActionGoalSendResult(
-                string goalId,
-                bool accepted,
-                string rosGoalId,
-                string message,
-                bool timedOut)
+            public ActionGoalSendHandle(string goalId, Task<SysCommand_ActionGoalResponse> response)
             {
                 GoalId = goalId;
-                Accepted = accepted;
-                RosGoalId = rosGoalId;
-                Message = message;
-                TimedOut = timedOut;
+                Response = response;
             }
+
+            public Task<bool> Accepted =>
+                Response.ContinueWith(
+                    t => t.Result.accepted,
+                    CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
         }
 
         public const string k_Version = "v0.8.0";
@@ -109,8 +105,6 @@ namespace Unity.Robotics.ROSTCPConnector
         readonly object m_PendingActionGoalResponsesLock = new object();
         readonly Dictionary<string, TaskCompletionSource<SysCommand_ActionGoalResponse>> m_PendingActionGoalResponses =
             new Dictionary<string, TaskCompletionSource<SysCommand_ActionGoalResponse>>();
-
-        int m_MainThreadId;
 
         private sealed class ActionListenerRegistration : IDisposable
         {
@@ -518,24 +512,16 @@ namespace Unity.Robotics.ROSTCPConnector
                 EnqueueActionRegistrationThreadSafe(registration);
         }
 
-        public ActionGoalSendResult SendActionGoal<TGoal>(
+        public ActionGoalSendHandle SendActionGoal<TGoal>(
             string actionName,
             TGoal goal,
-            string goalId = null,
-            float timeoutSeconds = 30.0f)
+            string goalId = null)
             where TGoal : Message
         {
             if (string.IsNullOrEmpty(goalId))
                 goalId = Guid.NewGuid().ToString();
             if (goal == null)
                 throw new ArgumentNullException(nameof(goal));
-
-            if (Thread.CurrentThread.ManagedThreadId == m_MainThreadId)
-            {
-                Debug.LogWarning(
-                    "SendActionGoal is blocking and should not be called from Unity's main thread. " +
-                    "Call from a background thread or use ListenForActionGoalResponses instead.");
-            }
 
             var tcs = new TaskCompletionSource<SysCommand_ActionGoalResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
             lock (m_PendingActionGoalResponsesLock)
@@ -552,37 +538,7 @@ namespace Unity.Robotics.ROSTCPConnector
 
             // 2) Send the goal payload as a framed message directly to `actionName`.
             QueueActionPayload(actionName, goal);
-
-            try
-            {
-                if (timeoutSeconds < 0)
-                {
-                    var response = tcs.Task.GetAwaiter().GetResult();
-                    return new ActionGoalSendResult(goalId, response.accepted, response.ros_goal_id, response.message, timedOut: false);
-                }
-
-                if (!tcs.Task.Wait(TimeSpan.FromSeconds(timeoutSeconds)))
-                {
-                    lock (m_PendingActionGoalResponsesLock)
-                    {
-                        m_PendingActionGoalResponses.Remove(goalId);
-                    }
-
-                    return new ActionGoalSendResult(goalId, accepted: false, rosGoalId: "", message: "Timed out waiting for __action_goal_response.", timedOut: true);
-                }
-
-                var completed = tcs.Task.Result;
-                return new ActionGoalSendResult(goalId, completed.accepted, completed.ros_goal_id, completed.message, timedOut: false);
-            }
-            catch (Exception ex)
-            {
-                lock (m_PendingActionGoalResponsesLock)
-                {
-                    m_PendingActionGoalResponses.Remove(goalId);
-                }
-
-                return new ActionGoalSendResult(goalId, accepted: false, rosGoalId: "", message: ex.Message, timedOut: false);
-            }
+            return new ActionGoalSendHandle(goalId, tcs.Task);
         }
 
         public void CancelActionGoal(string actionName, string goalId)
@@ -837,8 +793,6 @@ namespace Unity.Robotics.ROSTCPConnector
         {
             if (_instance == null)
                 _instance = this;
-
-            m_MainThreadId = Thread.CurrentThread.ManagedThreadId;
         }
 
         void Start()
