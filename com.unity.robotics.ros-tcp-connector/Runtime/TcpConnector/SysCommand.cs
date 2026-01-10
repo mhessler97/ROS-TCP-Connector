@@ -22,6 +22,10 @@ namespace Unity.Robotics.ROSTCPConnector
         public const string k_SysCommand_RemovePublisher = "__remove_publisher";
         public const string k_SysCommand_RemoveRosService = "__remove_ros_service";
         public const string k_SysCommand_RemoveUnityService = "__remove_unity_service";
+        public const string k_SysCommand_ActionFeedback = "__action_feedback";
+        public const string k_SysCommand_ActionResult = "__action_result";
+        public const string k_SysCommand_ActionGoalRequest = "__action_goal_request";
+        public const string k_SysCommand_ActionGoalResponse = "__action_goal_response";
 
         public abstract string Command
         {
@@ -67,6 +71,15 @@ namespace Unity.Robotics.ROSTCPConnector
     {
         public string action_name;
         public string goal_id;       // stringified UUID
+    }
+
+    public struct SysCommand_ActionGoalResponse
+    {
+        public string action_name;
+        public string goal_id;       // stringified UUID (provided by Unity)
+        public bool accepted;
+        public string ros_goal_id;   // ROS uuid hex string when accepted, empty otherwise
+        public string message;       // optional text (e.g. "rejected" / exception string)
     }
 
     public struct SysCommand_Topic

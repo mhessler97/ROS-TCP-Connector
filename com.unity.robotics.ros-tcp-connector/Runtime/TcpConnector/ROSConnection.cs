@@ -15,6 +15,29 @@ namespace Unity.Robotics.ROSTCPConnector
 {
     public class ROSConnection : MonoBehaviour
     {
+        public readonly struct ActionGoalSendResult
+        {
+            public readonly string GoalId;
+            public readonly bool Accepted;
+            public readonly string RosGoalId;
+            public readonly string Message;
+            public readonly bool TimedOut;
+
+            public ActionGoalSendResult(
+                string goalId,
+                bool accepted,
+                string rosGoalId,
+                string message,
+                bool timedOut)
+            {
+                GoalId = goalId;
+                Accepted = accepted;
+                RosGoalId = rosGoalId;
+                Message = message;
+                TimedOut = timedOut;
+            }
+        }
+
         public const string k_Version = "v0.8.0";
         public const string k_CompatibleVersionPrefix = "v0.8.";
 
@@ -80,6 +103,14 @@ namespace Unity.Robotics.ROSTCPConnector
         readonly object m_ActionRegistrationsLock = new object();
         readonly Dictionary<string, SysCommand_ActionRegistration> m_ActionRegistrations =
             new Dictionary<string, SysCommand_ActionRegistration>();
+        readonly object m_ActionGoalResponseCallbacksLock = new object();
+        readonly List<Action<SysCommand_ActionGoalResponse>> m_ActionGoalResponseCallbacks =
+            new List<Action<SysCommand_ActionGoalResponse>>();
+        readonly object m_PendingActionGoalResponsesLock = new object();
+        readonly Dictionary<string, TaskCompletionSource<SysCommand_ActionGoalResponse>> m_PendingActionGoalResponses =
+            new Dictionary<string, TaskCompletionSource<SysCommand_ActionGoalResponse>>();
+
+        int m_MainThreadId;
 
         private sealed class ActionListenerRegistration : IDisposable
         {
@@ -115,6 +146,30 @@ namespace Unity.Robotics.ROSTCPConnector
         {
             public static readonly NullActionListenerRegistration Instance = new NullActionListenerRegistration();
             public void Dispose() { }
+        }
+
+        private sealed class ActionGoalResponseListenerRegistration : IDisposable
+        {
+            readonly ROSConnection m_Owner;
+            readonly Action<SysCommand_ActionGoalResponse> m_Callback;
+            bool m_Disposed;
+
+            public ActionGoalResponseListenerRegistration(
+                ROSConnection owner,
+                Action<SysCommand_ActionGoalResponse> callback)
+            {
+                m_Owner = owner;
+                m_Callback = callback;
+            }
+
+            public void Dispose()
+            {
+                if (m_Disposed)
+                    return;
+
+                m_Disposed = true;
+                m_Owner.UnregisterActionGoalResponseCallback(m_Callback);
+            }
         }
 
         class OutgoingMessageQueue
@@ -463,13 +518,30 @@ namespace Unity.Robotics.ROSTCPConnector
                 EnqueueActionRegistrationThreadSafe(registration);
         }
 
-        public string SendActionGoal<TGoal>(string actionName, TGoal goal, string goalId = null)
+        public ActionGoalSendResult SendActionGoal<TGoal>(
+            string actionName,
+            TGoal goal,
+            string goalId = null,
+            float timeoutSeconds = 30.0f)
             where TGoal : Message
         {
             if (string.IsNullOrEmpty(goalId))
                 goalId = Guid.NewGuid().ToString();
             if (goal == null)
                 throw new ArgumentNullException(nameof(goal));
+
+            if (Thread.CurrentThread.ManagedThreadId == m_MainThreadId)
+            {
+                Debug.LogWarning(
+                    "SendActionGoal is blocking and should not be called from Unity's main thread. " +
+                    "Call from a background thread or use ListenForActionGoalResponses instead.");
+            }
+
+            var tcs = new TaskCompletionSource<SysCommand_ActionGoalResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
+            lock (m_PendingActionGoalResponsesLock)
+            {
+                m_PendingActionGoalResponses[goalId] = tcs;
+            }
 
             // 1) Tell endpoint a goal is coming
             QueueSysCommand("__action_goal", new SysCommand_ActionWithGoalId
@@ -480,7 +552,37 @@ namespace Unity.Robotics.ROSTCPConnector
 
             // 2) Send the goal payload as a framed message directly to `actionName`.
             QueueActionPayload(actionName, goal);
-            return goalId;
+
+            try
+            {
+                if (timeoutSeconds < 0)
+                {
+                    var response = tcs.Task.GetAwaiter().GetResult();
+                    return new ActionGoalSendResult(goalId, response.accepted, response.ros_goal_id, response.message, timedOut: false);
+                }
+
+                if (!tcs.Task.Wait(TimeSpan.FromSeconds(timeoutSeconds)))
+                {
+                    lock (m_PendingActionGoalResponsesLock)
+                    {
+                        m_PendingActionGoalResponses.Remove(goalId);
+                    }
+
+                    return new ActionGoalSendResult(goalId, accepted: false, rosGoalId: "", message: "Timed out waiting for __action_goal_response.", timedOut: true);
+                }
+
+                var completed = tcs.Task.Result;
+                return new ActionGoalSendResult(goalId, completed.accepted, completed.ros_goal_id, completed.message, timedOut: false);
+            }
+            catch (Exception ex)
+            {
+                lock (m_PendingActionGoalResponsesLock)
+                {
+                    m_PendingActionGoalResponses.Remove(goalId);
+                }
+
+                return new ActionGoalSendResult(goalId, accepted: false, rosGoalId: "", message: ex.Message, timedOut: false);
+            }
         }
 
         public void CancelActionGoal(string actionName, string goalId)
@@ -592,6 +694,27 @@ namespace Unity.Robotics.ROSTCPConnector
             }
 
             RegisterActionHandlers(actionName, feedbackWrapper, resultWrapper);
+        }
+
+        public IDisposable ListenForActionGoalResponses(Action<SysCommand_ActionGoalResponse> callback)
+        {
+            if (callback == null)
+                throw new ArgumentNullException(nameof(callback));
+
+            lock (m_ActionGoalResponseCallbacksLock)
+            {
+                m_ActionGoalResponseCallbacks.Add(callback);
+            }
+
+            return new ActionGoalResponseListenerRegistration(this, callback);
+        }
+
+        void UnregisterActionGoalResponseCallback(Action<SysCommand_ActionGoalResponse> callback)
+        {
+            lock (m_ActionGoalResponseCallbacksLock)
+            {
+                m_ActionGoalResponseCallbacks.Remove(callback);
+            }
         }
 
         public RosActionClient<TGoal, TFeedback, TResult> CreateActionClient<TGoal, TFeedback, TResult>(
@@ -714,6 +837,8 @@ namespace Unity.Robotics.ROSTCPConnector
         {
             if (_instance == null)
                 _instance = this;
+
+            m_MainThreadId = Thread.CurrentThread.ManagedThreadId;
         }
 
         void Start()
@@ -786,6 +911,8 @@ namespace Unity.Robotics.ROSTCPConnector
                 //For all publishers, notify that they need to re-register.
                 topicInfo.OnConnectionLost();
             }
+
+            FailPendingActionGoalResponses(new OperationCanceledException("Connection lost before __action_goal_response was received."));
         }
 
         public void Disconnect()
@@ -794,6 +921,29 @@ namespace Unity.Robotics.ROSTCPConnector
             //The thread may be waiting on a ManualResetEvent, if so, this will wake it so it can exit immediately.
             m_OutgoingMessageQueue?.NewMessageReadyToSendEvent?.Set();
             m_ConnectionThreadCancellation = null;
+
+            FailPendingActionGoalResponses(new OperationCanceledException("Disconnected before __action_goal_response was received."));
+        }
+
+        void FailPendingActionGoalResponses(Exception exception)
+        {
+            if (exception == null)
+                exception = new OperationCanceledException("Canceled.");
+
+            List<TaskCompletionSource<SysCommand_ActionGoalResponse>> pending;
+            lock (m_PendingActionGoalResponsesLock)
+            {
+                if (m_PendingActionGoalResponses.Count == 0)
+                    return;
+
+                pending = new List<TaskCompletionSource<SysCommand_ActionGoalResponse>>(m_PendingActionGoalResponses.Values);
+                m_PendingActionGoalResponses.Clear();
+            }
+
+            foreach (var tcs in pending)
+            {
+                tcs.TrySetException(exception);
+            }
         }
 
         void OnValidate()
@@ -984,7 +1134,7 @@ namespace Unity.Robotics.ROSTCPConnector
                     }
 
                     break;
-                case "__action_feedback":
+                case SysCommand.k_SysCommand_ActionFeedback:
                     {
                         var info = JsonUtility.FromJson<SysCommand_ActionWithGoalId>(json);
                         // Next message will be the Feedback payload addressed to `info.action_name`
@@ -1017,7 +1167,7 @@ namespace Unity.Robotics.ROSTCPConnector
                         };
                         break;
                     }
-                case "__action_result":
+                case SysCommand.k_SysCommand_ActionResult:
                     {
                         var info = JsonUtility.FromJson<SysCommand_ActionWithGoalId>(json);
                         // Next message will be the Result payload addressed to `info.action_name`
@@ -1050,7 +1200,7 @@ namespace Unity.Robotics.ROSTCPConnector
                         };
                         break;
                     }
-                case "__action_goal_request":
+                case SysCommand.k_SysCommand_ActionGoalRequest:
                     {
                         // This is only relevant if you later add a Unity-side Action *server*.
                         // For now, consume the following payload (the Goal) and log it so the queue stays aligned.
@@ -1062,6 +1212,43 @@ namespace Unity.Robotics.ROSTCPConnector
                                             $"but no server-side handler is registered.");
                             // If you implement a server, deserialize payload here as the Goal and start execution.
                         };
+                        break;
+                    }
+                case SysCommand.k_SysCommand_ActionGoalResponse:
+                    {
+                        var response = JsonUtility.FromJson<SysCommand_ActionGoalResponse>(json);
+                        TaskCompletionSource<SysCommand_ActionGoalResponse> pending = null;
+                        lock (m_PendingActionGoalResponsesLock)
+                        {
+                            if (m_PendingActionGoalResponses.TryGetValue(response.goal_id, out pending))
+                            {
+                                m_PendingActionGoalResponses.Remove(response.goal_id);
+                            }
+                        }
+
+                        pending?.TrySetResult(response);
+
+                        Action<SysCommand_ActionGoalResponse>[] callbacks;
+                        lock (m_ActionGoalResponseCallbacksLock)
+                        {
+                            callbacks = m_ActionGoalResponseCallbacks.ToArray();
+                        }
+
+                        if (callbacks.Length == 0)
+                        {
+                            Debug.LogWarning($"No action goal response listener for {response.action_name} (goal {response.goal_id}).");
+                            break;
+                        }
+
+                        foreach (var callback in callbacks)
+                        {
+                            try
+                            {
+                                callback(response);
+                            }
+                            catch (Exception ex) { Debug.LogException(ex); }
+                        }
+
                         break;
                     }
             }

@@ -37,9 +37,9 @@ namespace Unity.Robotics.ROSTCPConnector
             m_Connection.ListenForAction(ActionName, onFeedback, onResult);
         }
 
-        public string SendGoal(TGoal goal, string goalId = null)
+        public ROSConnection.ActionGoalSendResult SendGoal(TGoal goal, string goalId = null, float timeoutSeconds = 30.0f)
         {
-            return m_Connection.SendActionGoal(ActionName, goal, goalId);
+            return m_Connection.SendActionGoal(ActionName, goal, goalId, timeoutSeconds);
         }
 
         public void CancelGoal(string goalId)
