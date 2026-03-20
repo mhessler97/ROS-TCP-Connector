@@ -80,6 +80,8 @@ namespace Unity.Robotics.ROSTCPConnector
         readonly object m_ActionRegistrationsLock = new object();
         readonly Dictionary<string, SysCommand_ActionRegistration> m_ActionRegistrations =
             new Dictionary<string, SysCommand_ActionRegistration>();
+        readonly object m_ActionGoalPublishersLock = new object();
+        readonly Dictionary<string, string> m_ActionGoalPublishers = new Dictionary<string, string>();
 
         private sealed class ActionListenerRegistration : IDisposable
         {
@@ -463,6 +465,35 @@ namespace Unity.Robotics.ROSTCPConnector
                 EnqueueActionRegistrationThreadSafe(registration);
         }
 
+        void EnsureActionGoalPublisherRegistered(string actionName, string goalMessageName)
+        {
+            bool shouldRegister = false;
+            lock (m_ActionGoalPublishersLock)
+            {
+                if (m_ActionGoalPublishers.TryGetValue(actionName, out var existingType))
+                {
+                    if (existingType != goalMessageName)
+                    {
+                        Debug.LogWarning($"Action '{actionName}' previously registered with goal type '{existingType}', " +
+                                         $"but new goal uses '{goalMessageName}'. Retaining original type.");
+                    }
+                    return;
+                }
+
+                m_ActionGoalPublishers[actionName] = goalMessageName;
+                shouldRegister = true;
+            }
+
+            if (!shouldRegister)
+                return;
+
+            var topicState = GetOrCreateTopic(actionName, goalMessageName);
+            if (!topicState.IsPublisher)
+            {
+                topicState.RegisterPublisher(k_DefaultPublisherQueueSize, k_DefaultPublisherLatch);
+            }
+        }
+
         public string SendActionGoal<TGoal>(string actionName, TGoal goal, string goalId = null)
             where TGoal : Message
         {
@@ -470,6 +501,8 @@ namespace Unity.Robotics.ROSTCPConnector
                 goalId = Guid.NewGuid().ToString();
             if (goal == null)
                 throw new ArgumentNullException(nameof(goal));
+
+            EnsureActionGoalPublisherRegistered(actionName, goal.RosMessageName);
 
             // 1) Tell endpoint a goal is coming
             QueueSysCommand("__action_goal", new SysCommand_ActionWithGoalId
