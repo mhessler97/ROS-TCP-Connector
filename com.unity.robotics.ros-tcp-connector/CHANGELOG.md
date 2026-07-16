@@ -13,6 +13,10 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/) a
 
 ### Added
 
+- Added subscriber-side `latch` overloads. In ROS 2, a compatible endpoint maps
+  these subscriptions to transient-local durability so late subscribers receive
+  retained messages.
+
 ### Changed
 
 ### Deprecated

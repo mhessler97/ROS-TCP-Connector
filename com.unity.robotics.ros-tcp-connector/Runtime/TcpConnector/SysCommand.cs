@@ -136,4 +136,11 @@ namespace Unity.Robotics.ROSTCPConnector
         public int queue_size;
         public bool latch;
     }
+
+    public struct SysCommand_SubscriberRegistration
+    {
+        public string topic;
+        public string message_name;
+        public bool latch;
+    }
 }

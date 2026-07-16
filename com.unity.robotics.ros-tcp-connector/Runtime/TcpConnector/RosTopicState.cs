@@ -43,6 +43,7 @@ namespace Unity.Robotics.ROSTCPConnector
 
         List<Action<Message>> m_SubscriberCallbacks = new List<Action<Message>>();
         public bool HasSubscriberCallback => m_SubscriberCallbacks.Count > 0;
+        public bool IsSubscriberLatched { get; private set; }
         public bool SentSubscriberRegistration { get; private set; }
 
         float m_LastMessageReceivedRealtime;
@@ -149,6 +150,24 @@ namespace Unity.Robotics.ROSTCPConnector
 
         public void AddSubscriber(Action<Message> callback)
         {
+            AddSubscriber(callback, false);
+        }
+
+        public void AddSubscriber(Action<Message> callback, bool latch)
+        {
+            if (latch && !IsSubscriberLatched)
+            {
+                IsSubscriberLatched = true;
+
+                // A topic has one ROS subscription shared by all of its Unity callbacks. If a
+                // later callback requests latching, upgrade that shared subscription in place.
+                if (SentSubscriberRegistration)
+                {
+                    m_ConnectionInternal.SendSubscriberUnregistration(m_Topic);
+                    SentSubscriberRegistration = false;
+                }
+            }
+
             m_SubscriberCallbacks.Add(callback);
 
             RegisterSubscriber();
@@ -158,7 +177,7 @@ namespace Unity.Robotics.ROSTCPConnector
         {
             if (m_Connection.HasConnectionThread && !SentSubscriberRegistration && !IsService)
             {
-                m_ConnectionInternal.SendSubscriberRegistration(m_Topic, m_RosMessageName, stream);
+                m_ConnectionInternal.SendSubscriberRegistration(m_Topic, m_RosMessageName, IsSubscriberLatched, stream);
                 SentSubscriberRegistration = true;
             }
         }
@@ -168,6 +187,7 @@ namespace Unity.Robotics.ROSTCPConnector
             m_SubscriberCallbacks.Clear();
             m_ConnectionInternal.SendSubscriberUnregistration(m_Topic);
             SentSubscriberRegistration = false;
+            IsSubscriberLatched = false;
         }
 
         public void ImplementService<TRequest, TResponse>(Func<TRequest, TResponse> implementation, int queueSize)
@@ -245,7 +265,7 @@ namespace Unity.Robotics.ROSTCPConnector
         {
             if (m_SubscriberCallbacks.Count > 0 && !SentSubscriberRegistration)
             {
-                m_ConnectionInternal.SendSubscriberRegistration(m_Topic, m_RosMessageName, stream);
+                m_ConnectionInternal.SendSubscriberRegistration(m_Topic, m_RosMessageName, IsSubscriberLatched, stream);
                 SentSubscriberRegistration = true;
             }
 
