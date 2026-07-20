@@ -226,9 +226,6 @@ namespace Unity.Robotics.ROSTCPConnector
             return m_Topics.TryGetValue(topic, out info) && info.HasSubscriberCallback;
         }
 
-        MessageSerializer m_MessageSerializer = new MessageSerializer();
-        readonly MessageSerializer m_ActionPayloadSerializer = new MessageSerializer();
-        readonly object m_ActionPayloadSerializerLock = new object();
         MessageDeserializer m_MessageDeserializer = new MessageDeserializer();
         List<Action<string[]>> m_TopicsListCallbacks = new List<Action<string[]>>();
         List<Action<Dictionary<string, string>>> m_TopicsAndTypesListCallbacks = new List<Action<Dictionary<string, string>>>();
@@ -418,9 +415,6 @@ namespace Unity.Robotics.ROSTCPConnector
         // Send a request to a ros service
         public async Task<RESPONSE> SendServiceMessage<RESPONSE>(string rosServiceName, Message serviceRequest) where RESPONSE : Message, new()
         {
-            m_MessageSerializer.Clear();
-            m_MessageSerializer.SerializeMessage(serviceRequest);
-            byte[] requestBytes = m_MessageSerializer.GetBytes();
             TaskPauser pauser = new TaskPauser();
 
             int srvID;
@@ -547,15 +541,17 @@ namespace Unity.Robotics.ROSTCPConnector
                 m_PendingActionGoalResponses[goalId] = tcs;
             }
 
-            // 1) Tell endpoint a goal is coming
-            QueueSysCommand("__action_goal", new SysCommand_ActionWithGoalId
-            {
-                action_name = actionName,
-                goal_id = goalId
-            });
-
-            // 2) Send the goal payload as a framed message directly to `actionName`.
-            QueueActionPayload(actionName, goal);
+            // Keep the goal header and payload in one outgoing queue item. The endpoint's
+            // protocol requires the payload to immediately follow its header.
+            QueueSysCommandWithMessage(
+                "__action_goal",
+                new SysCommand_ActionWithGoalId
+                {
+                    action_name = actionName,
+                    goal_id = goalId
+                },
+                actionName,
+                goal);
             return new ActionGoalSendHandle(goalId, tcs.Task);
         }
 
@@ -566,17 +562,6 @@ namespace Unity.Robotics.ROSTCPConnector
                 action_name = actionName,
                 goal_id = goalId
             });
-        }
-
-        void QueueActionPayload<TGoal>(string actionName, TGoal goal) where TGoal : Message
-        {
-            lock (m_ActionPayloadSerializerLock)
-            {
-                m_ActionPayloadSerializer.Clear();
-                m_ActionPayloadSerializer.Write(actionName);
-                m_ActionPayloadSerializer.SerializeMessageWithLength(goal);
-                m_OutgoingMessageQueue.Enqueue(new SerializedMessageSender(m_ActionPayloadSerializer.GetBytesSequence()));
-            }
         }
 
         internal IDisposable RegisterActionHandlers(
@@ -768,9 +753,13 @@ namespace Unity.Robotics.ROSTCPConnector
                 m_Self.SendSysCommand(SysCommand.k_SysCommand_RemoveUnityService, new SysCommand_Topic { topic = topic }, stream);
             }
 
-            public void SendUnityServiceResponse(int serviceId, NetworkStream stream = null)
+            public void SendUnityServiceResponse(int serviceId, string destination, Message response)
             {
-                m_Self.SendSysCommand(SysCommand.k_SysCommand_ServiceResponse, new SysCommand_Service { srv_id = serviceId }, stream);
+                m_Self.QueueSysCommandWithMessage(
+                    SysCommand.k_SysCommand_ServiceResponse,
+                    new SysCommand_Service { srv_id = serviceId },
+                    destination,
+                    response);
             }
 
             public void SendPublisherRegistration(string topic, string message_name, int queueSize, bool latch, NetworkStream stream = null)
@@ -780,9 +769,13 @@ namespace Unity.Robotics.ROSTCPConnector
                 );
             }
 
-            public void SendServiceRequest(int serviceId)
+            public void SendServiceRequest(int serviceId, string destination, Message request)
             {
-                m_Self.SendSysCommand(SysCommand.k_SysCommand_ServiceRequest, new SysCommand_Service { srv_id = serviceId });
+                m_Self.QueueSysCommandWithMessage(
+                    SysCommand.k_SysCommand_ServiceRequest,
+                    new SysCommand_Service { srv_id = serviceId },
+                    destination,
+                    request);
             }
 
             public void AddSenderToQueue(OutgoingMessageSender sender)
@@ -1484,8 +1477,23 @@ namespace Unity.Robotics.ROSTCPConnector
 
         public void QueueSysCommand(string command, object param)
         {
-            PopulateSysCommand(m_MessageSerializer, command, param);
-            m_OutgoingMessageQueue.Enqueue(new SysCommandSender(m_MessageSerializer.GetBytesSequence()));
+            MessageSerializer messageSerializer = new MessageSerializer();
+            PopulateSysCommand(messageSerializer, command, param);
+            m_OutgoingMessageQueue.Enqueue(new SysCommandSender(messageSerializer.GetBytesSequence()));
+        }
+
+        void QueueSysCommandWithMessage(string command, object param, string destination, Message message)
+        {
+            MessageSerializer commandSerializer = new MessageSerializer();
+            PopulateSysCommand(commandSerializer, command, param);
+
+            MessageSerializer payloadSerializer = new MessageSerializer();
+            payloadSerializer.Write(destination);
+            payloadSerializer.SerializeMessageWithLength(message);
+
+            List<byte[]> frames = commandSerializer.GetBytesSequence();
+            frames.AddRange(payloadSerializer.GetBytesSequence());
+            m_OutgoingMessageQueue.Enqueue(new SerializedMessageSender(frames));
         }
 
         [Obsolete("Use Publish instead of Send", false)]

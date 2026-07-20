@@ -25,6 +25,9 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/) a
 
 ### Fixed
 
+- Queue service request, service response, and action goal headers together
+  with their payloads so other TCP frames cannot be interleaved between them.
+
 
 ## [0.7.0-preview] - 2022-02-01
 

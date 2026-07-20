@@ -133,10 +133,8 @@ namespace Unity.Robotics.ROSTCPConnector
 
             m_ServiceResponseTopic.OnMessageSent(response);
 
-            // send the response message back
-            m_ConnectionInternal.SendUnityServiceResponse(serviceId);
-            m_MessageSender.Queue(response);
-            m_ConnectionInternal.AddSenderToQueue(m_MessageSender);
+            // Send the response header and payload as one indivisible queue item.
+            m_ConnectionInternal.SendUnityServiceResponse(serviceId, m_Topic, response);
         }
 
         Message Deserialize(byte[] data)
@@ -255,9 +253,8 @@ namespace Unity.Robotics.ROSTCPConnector
 
         internal void SendServiceRequest(Message requestMessage, int serviceId)
         {
-            m_ConnectionInternal.SendServiceRequest(serviceId);
-            m_MessageSender.Queue(requestMessage);
-            m_ConnectionInternal.AddSenderToQueue(m_MessageSender);
+            // Send the request header and payload as one indivisible queue item.
+            m_ConnectionInternal.SendServiceRequest(serviceId, m_Topic, requestMessage);
             OnMessageSent(requestMessage);
         }
 
